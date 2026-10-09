@@ -7,6 +7,7 @@
     - Outputs HTML / CSV reports via WinMerge (minimized, non-interactive)
     - Detects differences by SHA256 hash (own implementation, file-level error handling)
     - Per-file errors are recorded (Status=Error + reason) and processing continues
+    - Unreadable folders are recorded (Status=FolderError) and the job becomes PARTIAL_ERROR
     - Log file, summary CSV, per-job file list CSV, timeout, cleanup of old reports
     - Exit code: 0=no differences / 1=differences found / 2=error
 
@@ -17,14 +18,19 @@
     Write one log line per file (useful to find the file that fails).
 
 .PARAMETER WhatIf
-    Dry run (WinMerge is not launched; hash check and file list still run).
+    Dry run (WinMerge is not launched, old reports are not removed;
+    hash check and file list still run).
 
 .EXAMPLE
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\tools\Invoke-FolderCompare.ps1
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\tools\Invoke-FolderCompare.ps1 -VerboseFileLog
 
 .NOTES
-    Target  : Windows 11 / Windows PowerShell 5.1+ (also PowerShell 7)
+    Version : 1.2.0 (2026-10-09)
+      1.2.0 - Recover from abandoned mutex (previous run was killed)
+            - Unreadable folders => Status=FolderError, Result=PARTIAL_ERROR, exit code 2
+      1.1.0 - Own SHA256 implementation, per-file error handling, file list CSV
+    Target  : Windows 11 / Windows PowerShell 5.1 (recommended) / PowerShell 7
     Requires: WinMerge 2.16+ (/noninteractive support)
     This file is ASCII only, so it is not affected by file encoding (BOM / Shift_JIS).
     The config JSON may contain Japanese; it is read explicitly as UTF-8.
@@ -37,6 +43,8 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+$script:ScriptVersion = '1.2.0'
 
 # ------------------------------------------------------------
 # Resolve script folder (not in param block; $PSScriptRoot may be
@@ -133,25 +141,45 @@ function Get-FileSha256 {
     }
 }
 
+function Get-RelativeOrFull {
+    # Convert a full path under Root to a relative path (for readability)
+    param([string]$Root, [string]$Path)
+    if ($Path -and $Path.StartsWith($Root, [StringComparison]::OrdinalIgnoreCase)) {
+        $rel = $Path.Substring($Root.Length).TrimStart('\')
+        if ($rel -eq '') { return '.' }
+        return $rel
+    }
+    return $Path
+}
+
 function Get-FileMap {
     <#
         Build a map: lower-case relative path -> { Relative, File }
-        Folders are not included (files only). Unreadable folders are logged.
+        Folders are not included (files only).
+        Folders that cannot be read are returned in FolderErrors
+        (v1.2.0: the caller treats them as errors, not just warnings).
     #>
     param(
         [string]$Root,
+        [string]$Side,
         [string[]]$IncludePatterns,
         [string[]]$ExcludePatterns,
         [bool]$Recurse
     )
     $map = @{}
+    $folderErrors = New-Object System.Collections.Generic.List[object]
     $rootFull = (Resolve-Path -LiteralPath $Root).ProviderPath.TrimEnd('\')
 
     $enumErrors = @()
     $files = @(Get-ChildItem -LiteralPath $rootFull -File -Recurse:$Recurse -Force `
                 -ErrorAction SilentlyContinue -ErrorVariable +enumErrors)
+
     foreach ($e in $enumErrors) {
-        Write-Log ('  Cannot read folder: {0} ({1})' -f $e.TargetObject, $e.Exception.Message) 'WARN'
+        $target = [string]$e.TargetObject
+        $relTarget = Get-RelativeOrFull -Root $rootFull -Path $target
+        $msg = $e.Exception.Message
+        $folderErrors.Add([pscustomobject]@{ Side = $Side; Path = $relTarget; Message = $msg })
+        Write-Log ('  Cannot read folder ({0}): {1} : {2}' -f $Side, $target, $msg) 'ERROR'
     }
 
     foreach ($f in $files) {
@@ -164,7 +192,8 @@ function Get-FileMap {
         if ($ExcludePatterns -and (Test-ExcludedPath -RelativePath $rel -FileName $f.Name -ExcludePatterns $ExcludePatterns)) { continue }
         $map[$rel.ToLowerInvariant()] = [pscustomobject]@{ Relative = $rel; File = $f }
     }
-    return $map
+
+    return [pscustomobject]@{ Map = $map; FolderErrors = $folderErrors }
 }
 
 function New-DetailRow {
@@ -185,6 +214,7 @@ function Compare-FolderByHash {
         Difference check independent of WinMerge language/report format.
         Different size => Different; same size => compare SHA256.
         A failure on one file does NOT stop the job (Status=Error).
+        An unreadable folder is recorded as Status=FolderError.
     #>
     param(
         [string]$Left, [string]$Right,
@@ -192,11 +222,18 @@ function Compare-FolderByHash {
         [bool]$Recurse,
         [bool]$FileLog
     )
-    $l = Get-FileMap -Root $Left  -IncludePatterns $IncludePatterns -ExcludePatterns $ExcludePatterns -Recurse $Recurse
-    $r = Get-FileMap -Root $Right -IncludePatterns $IncludePatterns -ExcludePatterns $ExcludePatterns -Recurse $Recurse
+    $lr = Get-FileMap -Root $Left  -Side 'Left'  -IncludePatterns $IncludePatterns -ExcludePatterns $ExcludePatterns -Recurse $Recurse
+    $rr = Get-FileMap -Root $Right -Side 'Right' -IncludePatterns $IncludePatterns -ExcludePatterns $ExcludePatterns -Recurse $Recurse
+    $l = $lr.Map; $r = $rr.Map
     Write-Log ('  Files: Left {0} / Right {1}' -f $l.Count, $r.Count)
 
     $details = New-Object System.Collections.Generic.List[object]
+
+    # Folder errors first (so they are visible at the top of the file list)
+    foreach ($fe in (@($lr.FolderErrors) + @($rr.FolderErrors))) {
+        $details.Add((New-DetailRow $fe.Path 'FolderError' $null $null ('[{0}] {1}' -f $fe.Side, $fe.Message)))
+    }
+
     $keys = @(@($l.Keys) + @($r.Keys) | Sort-Object -Unique)
 
     foreach ($k in $keys) {
@@ -222,17 +259,19 @@ function Compare-FolderByHash {
             Write-Log ('  File ERROR: {0} : {1}' -f $rel, $msg) 'WARN'
         }
         $details.Add($row)
-        if ($FileLog) { Write-Log ('    {0,-9} {1}' -f $row.Status, $rel) }
+        if ($FileLog) { Write-Log ('    {0,-11} {1}' -f $row.Status, $rel) }
     }
 
+    $fileRows = @($details | Where-Object { $_.Status -ne 'FolderError' })
     return [pscustomobject]@{
-        Total     = $details.Count
-        Same      = @($details | Where-Object { $_.Status -eq 'Same' }).Count
-        Different = @($details | Where-Object { $_.Status -eq 'Different' }).Count
-        LeftOnly  = @($details | Where-Object { $_.Status -eq 'LeftOnly' }).Count
-        RightOnly = @($details | Where-Object { $_.Status -eq 'RightOnly' }).Count
-        Errors    = @($details | Where-Object { $_.Status -eq 'Error' }).Count
-        Details   = $details
+        Total        = $fileRows.Count
+        Same         = @($fileRows | Where-Object { $_.Status -eq 'Same' }).Count
+        Different    = @($fileRows | Where-Object { $_.Status -eq 'Different' }).Count
+        LeftOnly     = @($fileRows | Where-Object { $_.Status -eq 'LeftOnly' }).Count
+        RightOnly    = @($fileRows | Where-Object { $_.Status -eq 'RightOnly' }).Count
+        Errors       = @($fileRows | Where-Object { $_.Status -eq 'Error' }).Count
+        FolderErrors = @($details  | Where-Object { $_.Status -eq 'FolderError' }).Count
+        Details      = $details
     }
 }
 
@@ -288,6 +327,30 @@ function Get-Prop {
     return $Default
 }
 
+function Enter-SingleInstance {
+    <#
+        Acquire the global mutex.
+        v1.2.0: If the previous run was killed (Task Scheduler stop, Ctrl+C,
+        process kill, PC shutdown), the mutex is "abandoned". WaitOne() then
+        throws AbandonedMutexException although ownership IS acquired.
+        This is treated as a successful acquisition with a warning.
+    #>
+    $m = New-Object System.Threading.Mutex($false, 'Global\Invoke-FolderCompare')
+    $acquired = $false
+    try {
+        $acquired = $m.WaitOne(0)
+    }
+    catch [System.Threading.AbandonedMutexException] {
+        $acquired = $true
+        Write-Log 'Previous run did not finish normally (abandoned lock). Lock was recovered and processing continues.' 'WARN'
+    }
+    if (-not $acquired) {
+        $m.Dispose()
+        throw 'Another compare process is already running.'
+    }
+    return $m
+}
+
 # ============================================================
 # Main
 # ============================================================
@@ -312,6 +375,7 @@ try {
     $script:LogFile = Join-Path $runDir 'compare.log'
 
     Write-Log ('===== Folder compare START ({0}) =====' -f $runStamp)
+    Write-Log ('Script    : {0} (ver {1})' -f $MyInvocation.MyCommand.Path, $script:ScriptVersion)
     Write-Log ('Config    : {0}' -f $ConfigPath)
     Write-Log ('Output    : {0}' -f $runDir)
     Write-Log ('PowerShell: {0}' -f $PSVersionTable.PSVersion)
@@ -321,8 +385,7 @@ try {
     $ver = (Get-Item -LiteralPath $winMerge).VersionInfo.ProductVersion
     Write-Log ('WinMerge  : {0} (ver {1})' -f $winMerge, $ver)
 
-    $mutex = New-Object System.Threading.Mutex($false, 'Global\Invoke-FolderCompare')
-    if (-not $mutex.WaitOne(0)) { $mutex.Dispose(); $mutex = $null; throw 'Another compare process is already running.' }
+    $mutex = Enter-SingleInstance
 
     $summary = New-Object System.Collections.Generic.List[object]
 
@@ -338,7 +401,8 @@ try {
 
         $row = [ordered]@{
             Job = $name; Left = $job.left; Right = $job.right
-            Result = ''; Total = ''; Same = ''; Different = ''; LeftOnly = ''; RightOnly = ''; Errors = ''
+            Result = ''; Total = ''; Same = ''; Different = ''; LeftOnly = ''; RightOnly = ''
+            Errors = ''; FolderErrors = ''
             Reports = ''; FileList = ''; Message = ''
         }
         Write-Log ('--- [{0}] start' -f $name)
@@ -371,30 +435,35 @@ try {
             }
             $row.Reports = $reports -join ';'
 
-            # 2) Hash-based difference check (all files listed, errors per file)
+            # 2) Hash-based difference check (all files listed, errors per file / folder)
             if ($useHashCheck) {
                 $r = Compare-FolderByHash -Left $job.left -Right $job.right `
                         -IncludePatterns $include -ExcludePatterns $exclude -Recurse $recurse `
                         -FileLog ([bool]$VerboseFileLog)
                 $row.Total = $r.Total; $row.Same = $r.Same; $row.Different = $r.Different
-                $row.LeftOnly = $r.LeftOnly; $row.RightOnly = $r.RightOnly; $row.Errors = $r.Errors
+                $row.LeftOnly = $r.LeftOnly; $row.RightOnly = $r.RightOnly
+                $row.Errors = $r.Errors; $row.FolderErrors = $r.FolderErrors
 
-                # All files (including Same) so that you can see exactly what was compared
                 $fileList = Join-Path $runDir ('{0}_files.csv' -f $safeName)
                 $r.Details | Export-Csv -LiteralPath $fileList -NoTypeInformation -Encoding UTF8 -WhatIf:$false
                 $row.FileList = Split-Path $fileList -Leaf
 
-                if ($r.Errors -gt 0) {
+                if (($r.Errors + $r.FolderErrors) -gt 0) {
+                    # v1.2.0: unreadable folders are also treated as errors
                     $row.Result = 'PARTIAL_ERROR'
                     $exitCode = 2
+                    if ($r.FolderErrors -gt 0) {
+                        $folderMsg = ('{0} folder(s) could not be read; files in them were NOT compared' -f $r.FolderErrors)
+                        $row.Message = if ($row.Message) { $row.Message + ' / ' + $folderMsg } else { $folderMsg }
+                    }
                 } elseif (($r.Different + $r.LeftOnly + $r.RightOnly) -gt 0) {
                     $row.Result = 'DIFF'
                     if ($exitCode -lt 1) { $exitCode = 1 }
                 } else {
                     $row.Result = 'SAME'
                 }
-                Write-Log ('  Result: {0} (Total {1} / Same {2} / Different {3} / LeftOnly {4} / RightOnly {5} / Error {6})' -f `
-                    $row.Result, $r.Total, $r.Same, $r.Different, $r.LeftOnly, $r.RightOnly, $r.Errors)
+                Write-Log ('  Result: {0} (Total {1} / Same {2} / Different {3} / LeftOnly {4} / RightOnly {5} / Error {6} / FolderError {7})' -f `
+                    $row.Result, $r.Total, $r.Same, $r.Different, $r.LeftOnly, $r.RightOnly, $r.Errors, $r.FolderErrors)
             } else {
                 $row.Result = 'REPORT_ONLY'
             }
