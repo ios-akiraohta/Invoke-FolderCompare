@@ -1,0 +1,32 @@
+{
+  "winMergePath": "C:\\Program Files\\WinMerge\\WinMergeU.exe",
+  "outputRoot": "C:\\tools\\reports",
+  "reportFormats": ["html", "csv"],
+  "retentionDays": 30,
+  "timeoutSec": 1800,
+  "hashCheck": true,
+  "jobs": [
+    {
+      "name": "設計書_v1_vs_v2",
+      "left": "C:\\docs\\設計書\\v1",
+      "right": "C:\\docs\\設計書\\v2",
+      "leftDesc": "旧版(v1)",
+      "rightDesc": "新版(v2)",
+      "recurse": true,
+      "filter": "*.docx;*.xlsx;*.pptx;*.md",
+      "include": ["*.docx", "*.xlsx", "*.pptx", "*.md"],
+      "exclude": ["~$*", "*\\~$*", "*.tmp", ".git\\*"]
+    },
+    {
+      "name": "デプロイ資産_ビルド_vs_デプロイ",
+      "left": "C:\\workspace\\projects\\bin",
+      "right": "C:\\deploy\\release_1.0\\",
+      "leftDesc": "ビルド資産",
+      "rightDesc": "デプロイ資産",
+      "recurse": true,
+      "filter": "*.class;*.xml;*.xhtml;*.css;*.js;*.jsp;*.properties;*.md",
+      "include": ["*.class", "*.xml", "*.xhtml", "*.css", "*.js", "*.jsp", "*.properties", "*.md"],
+      "exclude": ["~$*", "*\\~$*", "*.tmp", ".git\\*"]
+    }
+  ]
+}
