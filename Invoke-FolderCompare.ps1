@@ -26,7 +26,11 @@
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\tools\Invoke-FolderCompare.ps1 -VerboseFileLog
 
 .NOTES
-    Version : 1.2.0 (2026-10-09)
+    Version : 1.2.1 (2026-10-09)
+      1.2.1 - Log is recorded even when the config file cannot be read
+              (fallback: <script folder>\reports\<timestamp>\compare.log)
+            - -WhatIf no longer logs old report folders as removed
+            - Empty "jobs" in the config is treated as an error (exit code 2)
       1.2.0 - Recover from abandoned mutex (previous run was killed)
             - Unreadable folders => Status=FolderError, Result=PARTIAL_ERROR, exit code 2
       1.1.0 - Own SHA256 implementation, per-file error handling, file list CSV
@@ -44,7 +48,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ScriptVersion = '1.2.0'
+$script:ScriptVersion = '1.2.1'
 
 # ------------------------------------------------------------
 # Resolve script folder (not in param block; $PSScriptRoot may be
@@ -65,6 +69,8 @@ if ([string]::IsNullOrEmpty($ConfigPath)) {
 # Common functions
 # ============================================================
 $script:LogFile = $null
+# v1.2.1: log lines written before the output folder is known are buffered here
+$script:LogBuffer = New-Object System.Collections.Generic.List[string]
 
 function Write-Log {
     param(
@@ -79,6 +85,31 @@ function Write-Log {
     }
     if ($script:LogFile) {
         Add-Content -LiteralPath $script:LogFile -Value $line -Encoding UTF8 -WhatIf:$false
+    } else {
+        $script:LogBuffer.Add($line)
+    }
+}
+
+function Open-LogFile {
+    <#
+        v1.2.1: Create the run folder and start the log file.
+        Buffered lines (written before this call) are flushed first.
+        Returns $true on success.
+    #>
+    param([string]$Dir)
+    try {
+        New-Item -ItemType Directory -Path $Dir -Force -WhatIf:$false -ErrorAction Stop | Out-Null
+        $path = Join-Path $Dir 'compare.log'
+        if ($script:LogBuffer.Count -gt 0) {
+            Add-Content -LiteralPath $path -Value $script:LogBuffer.ToArray() -Encoding UTF8 -WhatIf:$false -ErrorAction Stop
+            $script:LogBuffer.Clear()
+        }
+        $script:LogFile = $path
+        return $true
+    }
+    catch {
+        Write-Host ('Cannot create log folder: {0} ({1})' -f $Dir, $_.Exception.Message) -ForegroundColor Yellow
+        return $false
     }
 }
 
@@ -314,8 +345,13 @@ function Remove-OldReports {
     Get-ChildItem -LiteralPath $Dir -Directory -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -match '^\d{8}_\d{6}$' -and $_.LastWriteTime -lt $limit } |
         ForEach-Object {
-            Write-Log ('Removed old report folder: {0}' -f $_.FullName)
-            Remove-Item -LiteralPath $_.FullName -Recurse -Force
+            if ($WhatIfPreference) {
+                # v1.2.1: do not log as removed in WhatIf mode
+                Write-Log ('WhatIf: old report folder would be removed: {0}' -f $_.FullName)
+            } else {
+                Remove-Item -LiteralPath $_.FullName -Recurse -Force
+                Write-Log ('Removed old report folder: {0}' -f $_.FullName)
+            }
         }
 }
 
@@ -358,7 +394,13 @@ $exitCode = 0
 $mutex = $null
 $runStamp = '{0:yyyyMMdd_HHmmss}' -f (Get-Date)
 
+$fallbackDir = Join-Path (Join-Path $script:ScriptDir 'reports') $runStamp
+
 try {
+    Write-Log ('===== Folder compare START ({0}) =====' -f $runStamp)
+    Write-Log ('Script    : {0} (ver {1})' -f $MyInvocation.MyCommand.Path, $script:ScriptVersion)
+    Write-Log ('Config    : {0}' -f $ConfigPath)
+
     if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
         throw ('Config file not found: {0}' -f $ConfigPath)
     }
@@ -371,12 +413,9 @@ try {
     $useHashCheck  = [bool](Get-Prop $config 'hashCheck' $true)
 
     $runDir = Join-Path $outputRoot $runStamp
-    New-Item -ItemType Directory -Path $runDir -Force -WhatIf:$false | Out-Null
-    $script:LogFile = Join-Path $runDir 'compare.log'
-
-    Write-Log ('===== Folder compare START ({0}) =====' -f $runStamp)
-    Write-Log ('Script    : {0} (ver {1})' -f $MyInvocation.MyCommand.Path, $script:ScriptVersion)
-    Write-Log ('Config    : {0}' -f $ConfigPath)
+    if (-not (Open-LogFile -Dir $runDir)) {
+        throw ('Cannot create output folder: {0} (check outputRoot in the config file)' -f $runDir)
+    }
     Write-Log ('Output    : {0}' -f $runDir)
     Write-Log ('PowerShell: {0}' -f $PSVersionTable.PSVersion)
     if ($WhatIfPreference) { Write-Log 'Mode      : WhatIf (WinMerge is not launched)' 'WARN' }
@@ -385,11 +424,18 @@ try {
     $ver = (Get-Item -LiteralPath $winMerge).VersionInfo.ProductVersion
     Write-Log ('WinMerge  : {0} (ver {1})' -f $winMerge, $ver)
 
+    $jobs = @()
+    if ($config.PSObject.Properties['jobs'] -and $null -ne $config.jobs) { $jobs = @($config.jobs) }
+    if ($jobs.Count -eq 0) {
+        throw 'No jobs defined in config file. Add at least one job to "jobs".'
+    }
+    Write-Log ('Jobs      : {0}' -f $jobs.Count)
+
     $mutex = Enter-SingleInstance
 
     $summary = New-Object System.Collections.Generic.List[object]
 
-    foreach ($job in @($config.jobs)) {
+    foreach ($job in $jobs) {
         $name      = [string]$job.name
         $safeName  = ConvertTo-SafeName $name
         $recurse   = [bool](Get-Prop $job 'recurse' $true)
@@ -489,6 +535,13 @@ catch {
     Write-Log ('FATAL: {0}' -f $_.Exception.Message) 'ERROR'
 }
 finally {
+    # v1.2.1: if the log file was never opened (config error etc.),
+    # write the buffered log to <script folder>\reports\<timestamp>\compare.log
+    if (-not $script:LogFile) {
+        if (Open-LogFile -Dir $fallbackDir) {
+            Write-Host ('Log file: {0}' -f $script:LogFile)
+        }
+    }
     if ($mutex) {
         try { $mutex.ReleaseMutex() } catch { }
         $mutex.Dispose()
