@@ -35,7 +35,7 @@ WinMerge を裏で呼び出して 2 つのフォルダを比較し、差分レ�
 ```
 .
 ├─ Invoke-FolderCompare.ps1        … スクリプト本体（ASCII のみで記述）
-├─ compare-config.json      … 設定ファイルのサンプル
+├─ compare-config.json             … 設定ファイルのサンプル
 ├─ docs/
 │   └─ フォルダ比較自動化ツール_運用マニュアル_v1.5.docx
 ├─ .gitignore
