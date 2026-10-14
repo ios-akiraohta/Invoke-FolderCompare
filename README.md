@@ -38,8 +38,7 @@ WinMerge を裏で呼び出して 2 つのフォルダを比較し、差分レ�
 ├─ compare-config.json             … 設定ファイルのサンプル
 ├─ docs/
 │   └─ フォルダ比較自動化ツール_運用マニュアル_v1.5.docx
-├─ .gitignore
-├─ .gitattributes
+├─ LICENSE
 └─ README.md
 ```
 
