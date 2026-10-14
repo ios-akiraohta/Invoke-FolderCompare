@@ -44,7 +44,7 @@ WinMerge を裏で呼び出して 2 つのフォルダを比較し、差分レ�
 ```
 
 > **Note**
-> 実運用の `compare-config.json` には、個人のフォルダパス（`C:\Users\<ユーザー名>\Box\…` など）が含まれます。リポジトリにはコミットせず、`compare-config.sample.json` をコピーして各自で作成してください。
+> 実運用の `compare-config.json` には、個人のフォルダパス（`C:\Users\<ユーザー名>\Box\…` など）が含まれます。リポジトリにはコミットせず、`compare-config.json` をコピーして各自で作成してください。
 
 ## セットアップ
 
